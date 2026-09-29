@@ -4,88 +4,157 @@ from config import ConfigManager
 
 class FSMEngine:
     def __init__(self, config_mgr: ConfigManager):
-        self.config = config_mgr
-        
-        # Menggabungkan Node Master dan daftar Slave untuk total lajur
-        self.nodes = [self.config.identity] + self.config.assigned_slave
-        self.nodes.sort()
-        self.num_nodes = len(self.nodes)
-        
-        # Konstanta jeda waktu
-        self.YELLOW_DURATION = 2.0
-        self.ALL_RED_DURATION = 1.5
+            self.config = config_mgr
+            
+            # 1. Menggabungkan Node Master dan daftar Slave untuk total lajur
+            self.nodes = [self.config.identity] + self.config.assigned_slaves
+            self.nodes.sort()
+            self.num_nodes = len(self.nodes)
+            
+            # 2. Parameter Fisika & Simulasi
+            self.SIMULATION_SPEED = 0.1  # Pengali waktu (0.5 = 2x lebih cepat di terminal)
+            self.max_green = self.config.min_green + self.config.max_extra_green
+            self.all_red_duration = self.config.conflict_zone_meter / self.config.vehicle_speed_ms
+            
+            # 3. Kamus pembobotan PCU (Passenger Car Unit)
+            self.PCU_WEIGHTS = {
+                "motor": 0.3,
+                "mobil": 1.0,
+                "truk": 2.0
+            }
 
-    #DUMMY data density
-    def get_dummy_densities(self) -> dict:
-       
-        return {node: round(random.uniform(0.0, 1.0), 2) for node in self.nodes}
+            print(f"[FSM ENGINE] Diinisialisasi untuk {self.num_nodes} Node: {self.nodes}")
+            print(f"[PHYSICS] All-Red Clearing Time: {self.all_red_duration:.1f} detik")
 
-    def calculate_green_time(self, density: float) -> float:
+   
+    def get_dummy_vehicles(self) -> dict:
+        # Dummy data
         
-        extra = density * self.config.max_extra_green
-        return float(self.config.min_green + extra)
+        yolo_data = {}
+        for node in self.nodes:
+            # Randomisasi ringan untuk demonstrasi Phase Skipping (kadang 0)
+            if random.random() > 0.8:
+                yolo_data[node] = {"motor": 0, "mobil": 0, "truk": 0}
+            else:
+                #Pembobotan PCU 
+                yolo_data[node] = {
+                    "motor": random.randint(0, 30),
+                    "mobil": random.randint(0, 15),
+                    "truk": random.randint(0, 3)
+                }
+        return yolo_data
 
-    def print_simulation_matrix(self, duration: float, active_node: int, current_state: str):
-        """Mencetak format bersih simulasi lampu tanpa teks gangguan."""
+    def generate(self) -> tuple:
+        
+        yolo_data = self.get_dummy_vehicles()
+        total_pcu_load = 0
+        cycle_schedule = []
+        node_pcu_loads = {}
+        
+        
+        STARTUP_LOST_TIME = 2.0   # Detik (Waktu reaksi pengemudi di barisan pertama)
+        SATURATION_HEADWAY = 2.1  # Detik (Waktu rata-rata 1 PCU melintasi garis stop)
+        
+        print(f"\n[YOLO DATA RAW] {yolo_data}")
+        
+        # Tahap A: Hitung Total Beban PCU dengan pembobotan
+        for node, vehicles in yolo_data.items():
+            pcu = (vehicles["motor"] * self.PCU_WEIGHTS["motor"]) + \
+                  (vehicles["mobil"] * self.PCU_WEIGHTS["mobil"]) + \
+                  (vehicles["truk"] * self.PCU_WEIGHTS["truk"])
+            
+            node_pcu_loads[node] = pcu
+            total_pcu_load += pcu
+
+        # Tahap B: Kalkulasi Durasi Hijau Aktual (Queue-Clearing)
+        if total_pcu_load == 0:
+            print("⚠️ Semua arah KOSONG. Failsafe: Berpindah ke Mode Malam (Flashing Yellow).")
+        else:
+            for node, pcu in node_pcu_loads.items():
+                if pcu == 0:
+                    print(f"⏩ Node {node} terdeteksi KOSONG : PHASE SKIPPED")
+                    continue
+                
+                
+                jml_lajur = self.config.lanes.get(node)
+                
+                
+                # Waktu Reaksi Awal + (Beban per lajur * Waktu stabil per PCU)
+                raw_gts = STARTUP_LOST_TIME + ((pcu / jml_lajur) * SATURATION_HEADWAY)
+                
+                # Batasi dengan min_green dan max_green
+                final_green = max(self.config.min_green, min(self.max_green, round(raw_gts)))
+                
+                cycle_schedule.append({"node": node, "green_time": final_green})
+                
+                # Log Pembuktian Kalkulasi di terminal Master
+                raw_count = sum(yolo_data[node].values())
+                print(f"✅ Kalkulasi Node {node} ({raw_count} Kend, Beban {pcu:.1f} PCU, {jml_lajur} Lajur)")
+                print(f"   -> {STARTUP_LOST_TIME}s (Reaksi) + {((pcu/jml_lajur)*SATURATION_HEADWAY):.1f}s (Jalan) = Butuh {raw_gts:.1f}s | Diputuskan: {final_green}s")
+                
+        return cycle_schedule, total_pcu_load
+    def broadcast_state(self, active_node, current_state, duration):
+       #nanti buat ngirim ke semua node
         status_list = []
         for node in self.nodes:
-            if current_state == "ALL_RED":
+            if current_state == "FLASHING_YELLOW":
+                node_state = "FLASH_YLW"
+            elif current_state == "ALL_RED":
                 node_state = "RED"
             elif node == active_node:
                 node_state = current_state
             else:
                 node_state = "RED"
-                
-            status_list.append(f"Node {node}: {node_state}")
+            status_list.append(f"N{node}:{node_state}")
             
-        print(f"[{duration:4.1f}s] -> {' | '.join(status_list)}")
+        # Menambahkan durasi di bagian depan matriks
+        print(f"[{duration:4.1f}s] 📡 [TX] -> {' | '.join(status_list)}")
 
     def run(self):
         print("\nStarting execution on Master terminal...")
         cycle_count = 1
         
         while True:
-            # ========================================================
-            # FASE 1: GENERATE FSM (1x Per Siklus)
-            # ========================================================
-            print(f"\n{'='*45}")
+            # 1. LOAD CONFIGURATION
+            self.config = ConfigManager() 
+            
+            if self.config.role != "master":
+                print(f"Tiang {self.config.identity} adalah Slave. Menunggu broadcast dari Master...")
+                time.sleep(2)
+                continue
+
+            print(f"\n{'='*55}")
             print(f"⚙️  GENERATE FSM SIKLUS {cycle_count}")
-            print(f"{'='*45}")
+            print(f"{'='*55}")
             
-            current_densities = self.get_dummy_densities()
-            cycle_schedule = []
+            # 2. KALKULASI MATEMATIS
+            cycle_schedule, total_pcu_load = self.generate()
+
+            # 3. PENYIARAN METRONOM (Eksekusi State Aktual)
+            print("\n📡 BROADCAST REAL-TIME BERJALAN:")
             
-            for node in self.nodes:
-                density = current_densities[node]
-                green_time = self.calculate_green_time(density)
-                
-                # Simpan hasil kalkulasi ke dalam jadwal siklus
-                cycle_schedule.append({
-                    "node": node,
-                    "green_time": green_time
-                })
-                print(f"-> Kalkulasi Node {node} : Kepadatan {density:.2f} = {green_time:4.1f}s Hijau")
-                
-            # TODO: Di titik ini, Master akan melakukan Broadcast JSON cycle_schedule ke semua Slave via LoRa
-            
-            # ========================================================
-            # FASE 2: EKSEKUSI SIMULASI (Clean Output)
-            # ========================================================
-            print("\n▶ SIMULASI BERJALAN:")
-            for step in cycle_schedule:
-                current_node = step["node"]
-                green_time = step["green_time"]
-                
-                # 1. State Hijau
-                self.print_simulation_matrix(green_time, current_node, "GREEN")
-                time.sleep(0.5) # Dipercepat untuk pengujian terminal
-                
-                # 2. State Kuning
-                self.print_simulation_matrix(self.YELLOW_DURATION, current_node, "YELLOW")
-                time.sleep(0.5)
-                
-                # 3. State Merah Semua (Jeda Aman)
-                self.print_simulation_matrix(self.ALL_RED_DURATION, None, "ALL_RED")
-                time.sleep(0.5)
-                
+            if total_pcu_load == 0:
+                # Eksekusi Mode Malam (Flashing Yellow)
+                duration_flash = 5.0
+                self.broadcast_state(None, "FLASHING_YELLOW", duration_flash)
+                time.sleep(duration_flash * self.SIMULATION_SPEED) 
+            else:
+                for step in cycle_schedule:
+                    current_node = step["node"]
+                    g_time = step["green_time"]
+                    
+                    print(f"\n--- Mengaktifkan Tiang {current_node} ---")
+                    
+                    # State: HIJAU
+                    self.broadcast_state(current_node, "GREEN", float(g_time))
+                    time.sleep(g_time * self.SIMULATION_SPEED)
+                    
+                    # State: KUNING
+                    self.broadcast_state(current_node, "YELLOW", float(self.config.yellow_duration))
+                    time.sleep(self.config.yellow_duration * self.SIMULATION_SPEED)
+                    
+                    # State: ALL-RED
+                    self.broadcast_state(None, "ALL_RED", float(self.all_red_duration))
+                    time.sleep(self.all_red_duration * self.SIMULATION_SPEED)
+                    
             cycle_count += 1

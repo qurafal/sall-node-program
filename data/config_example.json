@@ -1,0 +1,19 @@
+{
+    "identity": 1,
+    "role": "master",
+    "assigned_master": 1,
+    "assigned_slaves": [2,3],
+    
+    "min_green": 10,
+    "max_extra_green": 40,
+    "yellow_duration": 3,
+    
+    "conflict_zone_meter": 150,
+    "vehicle_speed_ms": 10,
+    
+    "lanes": {
+        "1": 1, 
+        "2": 1,
+        "3": 2
+    }
+}

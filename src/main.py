@@ -35,7 +35,7 @@ def main():
         emergency_mode()
         
     except KeyboardInterrupt:
-        print("\n[SHUTDOWN] Sistem dihentikan dengan aman oleh pengguna.")
+        print("\n[SHUTDOWN] Sistem dihentikan dengan oleh pengguna.")
 
 if __name__ == "__main__":
     main()
