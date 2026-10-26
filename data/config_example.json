@@ -1,19 +1,39 @@
 {
-    "identity": 1,
-    "role": "master",
-    "assigned_master": 1,
-    "assigned_slaves": [2,3],
-    
     "min_green": 10,
     "max_extra_green": 40,
     "yellow_duration": 3,
-    
+    "y_sec": 3,
+    "r_sec": 2,
     "conflict_zone_meter": 150,
     "vehicle_speed_ms": 10,
-    
-    "lanes": {
-        "1": 1, 
-        "2": 1,
-        "3": 2
-    }
+    "saturation_headway_sec": 2.1,
+    "re_evaluate_interval_sec": 10,
+    "lanes": [
+        [1, 1, 2],
+        [2, 3, 4],
+        [1, 5, 6],
+        [1, 7, 8]
+    ],
+    "streams": [
+        {"lane_count": 2, "queue": 0},
+        {"lane_count": 2, "queue": 0},
+        {"lane_count": 2, "queue": 0},
+        {"lane_count": 2, "queue": 0}
+    ],
+    "conflict_matrix": [
+        [0, 0, 0, 0, 1, 1, 1, 1],
+        [0, 0, 0, 0, 1, 1, 1, 1],
+        [0, 0, 0, 0, 1, 1, 1, 1],
+        [0, 0, 0, 0, 1, 1, 1, 1],
+        [1, 1, 1, 1, 0, 0, 0, 0],
+        [1, 1, 1, 1, 0, 0, 0, 0],
+        [1, 1, 1, 1, 0, 0, 0, 0],
+        [1, 1, 1, 1, 0, 0, 0, 0]
+    ],
+    "fallback_sequence": [
+        {"active_streams": [0, 1, 2, 3], "duration_s": 30}
+    ],
+    "serial_port": "/dev/ttyUSB0",
+    "baud_rate": 115200,
+    "yolo_poll_interval_sec": 2
 }
