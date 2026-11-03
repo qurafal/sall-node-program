@@ -1,28 +1,23 @@
 import json
 import os
-
-from protocol import (
-    LANES_STATE,
-    OPPOSING_APPROACH,
-)
+import math
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), '../data/config.json')
 EXAMPLE_CONFIG_FILE = os.path.join(os.path.dirname(__file__), '../data/config_example.json')
 
 REQUIRED_KEYS = [
-    "min_green", "max_extra_green", "yellow_duration",
-    "conflict_zone_meter", "vehicle_speed_ms", "lanes",
-    "serial_port"
+    "min_green", "max_extra_green",
+    "conflict_zone_meter", "vehicle_speed_kmh", "lanes",
+    "serial_port",
+    "saturation_headway_sec", "re_evaluate_interval_sec", "yolo_poll_interval_sec"
 ]
 
-VALID_PAIRS = [(1, 2), (3, 4), (5, 6), (7, 8)]
 MAX_CYCLE_STEPS = 8
 
 # EFSM/cloud config defaults
 DEFAULT_INACTIVE_QUEUE_THRESHOLD = 5
 DEFAULT_STARVATION_TOLERANCE = 30
-DEFAULT_YELLOW_SEC = 3
-DEFAULT_RED_SEC = 2
+DEFAULT_FALLBACK_SEQUENCE = []
 DEFAULT_SATURATION_HEADWAY_SEC = 2.1
 DEFAULT_FALLBACK_SEQUENCE = []
 DEFAULT_RE_EVALUATE_INTERVAL_SEC = 10
@@ -30,146 +25,215 @@ DEFAULT_RE_EVALUATE_INTERVAL_SEC = 10
 
 def _parse_lanes(lanes, errors) -> tuple:
     """
-    Parse new lanes format: list of [count, lamp_id1, lamp_id2, ...]
-    Returns (lane_id_to_count: dict[int, int], phases: list[TrafficState])
+    Parse lanes format: list of [count, stream_id1, stream_id2, ...]
+    Stream IDs are 0-indexed to match conflict_matrix.
+    Returns (lane_id_to_count: dict[int, int], lanes_info: list)
     """
     if lanes is None:
         return {}, []
     if not isinstance(lanes, list):
-        errors.append("CRITICAL ERROR: 'lanes' harus berupa daftar [[count, lamp_id...], ...]!")
+        errors.append("CRITICAL ERROR: 'lanes' harus berupa daftar [[count, stream_id...], ...]!")
         return {}, []
     if not lanes:
         errors.append("CRITICAL ERROR: 'lanes' tidak boleh kosong!")
         return {}, []
 
     lane_id_to_count = {}
-    normalized = []
-    seen = set()
-    pair_starts = set()
-    has_pair = False
+    lanes_info = []
+    seen_streams = set()
 
     for idx, entry in enumerate(lanes):
         if isinstance(entry, bool):
             errors.append(
-                f"CRITICAL ERROR: Entri #{idx+1} di 'lanes' tidak valid: {entry!r}")
+                f"CRITICAL ERROR: Entri #{idx + 1} di 'lanes' tidak valid: {entry!r}")
             continue
         if not isinstance(entry, list):
             errors.append(
-                f"CRITICAL ERROR: Entri #{idx+1} di 'lanes' harus berupa daftar [count, lamp_id...]!")
+                f"CRITICAL ERROR: Entri #{idx + 1} di 'lanes' harus berupa daftar [count, stream_id...]!")
             continue
-        if len(entry) < 2:
+        if len(entry) < 1:
             errors.append(
-                f"CRITICAL ERROR: Entri #{idx+1} di 'lanes' minimal 2 elemen [count, lamp_id]!")
+                f"CRITICAL ERROR: Entri #{idx + 1} di 'lanes' tidak boleh kosong.")
             continue
 
-        count = entry[0]
-        lamp_ids = entry[1:]
+        count = 1
+        stream_ids = entry
 
-        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
-            errors.append(
-                f"CRITICAL ERROR: Jumlah lajur (elemen pertama) entri #{idx+1} tidak valid: {count!r}. Harus integer positif.")
-            continue
-
-        valid_lamp_ids = []
-        for lamp_id in lamp_ids:
-            if isinstance(lamp_id, bool) or not isinstance(lamp_id, int) or not (1 <= lamp_id <= 8):
+        valid_stream_ids = []
+        for sid in stream_ids:
+            if isinstance(sid, bool) or not isinstance(sid, int) or not (0 <= sid <= 7):
                 errors.append(
-                    f"CRITICAL ERROR: Lamp ID '{lamp_id}' tidak valid di entri #{idx+1}! Hanya 1-8 yang diperbolehkan.")
+                    f"CRITICAL ERROR: Stream ID '{sid}' tidak valid di entri #{idx + 1}! Hanya 0-7 yang diperbolehkan (0-indexed).")
                 continue
-            if lamp_id in seen:
+            if sid in seen_streams:
                 errors.append(
-                    f"CRITICAL ERROR: Duplikat lamp ID {lamp_id} di 'lanes'!")
+                    f"CRITICAL ERROR: Duplikat stream ID {sid} di 'lanes'!")
                 continue
-            seen.add(lamp_id)
-            lane_id_to_count[lamp_id] = count
-            valid_lamp_ids.append(lamp_id)
+            seen_streams.add(sid)
+            lane_id_to_count[sid] = count
+            valid_stream_ids.append(sid)
 
-        if len(lamp_ids) != len(valid_lamp_ids):
+        if len(stream_ids) != len(valid_stream_ids):
             continue
 
-        if len(valid_lamp_ids) == 1:
-            normalized.append(("lane", valid_lamp_ids[0]))
-        elif len(valid_lamp_ids) == 2:
-            pair = tuple(valid_lamp_ids)
-            if pair not in VALID_PAIRS:
-                errors.append(
-                    f"CRITICAL ERROR: Pasangan {list(pair)} tidak valid di entri #{idx+1}! "
-                    f"Hanya [1,2], [3,4], [5,6], [7,8] yang diperbolehkan.")
-                continue
-            if pair in seen:
-                errors.append(
-                    f"CRITICAL ERROR: Duplikat entri pasangan {list(pair)} di 'lanes'!")
-                continue
-            seen.add(pair)
-            pair_starts.add(pair[0])
-            has_pair = True
-            normalized.append(("pair", pair))
-        else:
-            errors.append(
-                f"CRITICAL ERROR: Entri #{idx+1} terlalu banyak lamp ID ({len(valid_lamp_ids)}). "
-                f"Maksimal 2 lamp ID per entri (single atau pair).")
-            continue
+        lanes_info.append({
+            "stream_ids": list(valid_stream_ids)
+        })
 
-    for kind, value in normalized:
-        if kind != "pair":
-            continue
-        opponent = OPPOSING_APPROACH[value[0]]
-        if opponent not in pair_starts:
-            errors.append(
-                f"CRITICAL ERROR: Pasangan {list(value)} membutuhkan pasangan lawannya "
-                f"[{opponent},{opponent+1}] di 'lanes'!")
-
-    if has_pair:
-        for kind, value in normalized:
-            if kind == "lane" and value % 2 == 0:
-                errors.append(
-                    f"CRITICAL ERROR: Lajur genap {value} tidak boleh aktif sendiri "
-                    f"selama ada pasangan di 'lanes' (gunakan [{value-1},{value}]).")
-
-    phases = _derive_phases(normalized)
-    if len(phases) > MAX_CYCLE_STEPS:
-        errors.append(
-            f"CRITICAL ERROR: Siklus terlalu panjang: {len(phases)} fase "
-            f"(maksimum {MAX_CYCLE_STEPS}).")
-
-    return lane_id_to_count, phases
-
-
-def _derive_phases(normalized) -> list:
-    """Turunkan fase siklus sesuai urutan 'lanes'.
-
-    Pasangan [a,b] menyusulkan APPROACH langsung; ketika pasangan lawan
-    dari satu set sudah keduanya muncul, OPPOSING disisipkan tepat
-    setelah APPROACH pasangan kedua.
-    """
-    phases = []
-    seen_starts = set()
-    for kind, value in normalized:
-        if kind == "lane":
-            phases.append(LANES_STATE[(value,)])
-            continue
-        phases.append(LANES_STATE[tuple(value)])
-        start = value[0]
-        seen_starts.add(start)
-        if OPPOSING_APPROACH[start] in seen_starts:
-            partner = OPPOSING_APPROACH[start]
-            phases.append(LANES_STATE[(min(start, partner), max(start, partner))])
-    return phases
+    return lane_id_to_count, lanes_info
 
 
 def _validate_and_parse(raw: dict) -> tuple:
     """Validasi + parsing tanpa melempar exception.
 
-    Mengembalikan (errors, lane_id_to_count, enabled_phases).
+    Mengembalikan (errors, lane_id_to_count, lanes_info).
     """
     errors = []
+    if not isinstance(raw, dict):
+        errors.append("CRITICAL ERROR: Konfigurasi harus berupa objek JSON!")
+        return errors, {}, []
+
     for key in REQUIRED_KEYS:
         if key not in raw:
             errors.append(
                 f"CRITICAL ERROR: Kunci '{key}' hilang dari konfigurasi! Hentikan sistem.")
 
-    lane_id_to_count, phases = _parse_lanes(raw.get("lanes"), errors)
-    return errors, lane_id_to_count, phases
+    # Validate numeric/integer fields
+    int_fields = ["min_green", "max_extra_green", "conflict_zone_meter", "vehicle_speed_kmh", "baud_rate"]
+    for key in int_fields:
+        if key in raw:
+            try:
+                val = int(raw[key])
+                if key == "baud_rate" and val <= 0:
+                    errors.append(f"CRITICAL ERROR: '{key}' harus > 0!")
+                elif key != "baud_rate" and val < 0:
+                    errors.append(f"CRITICAL ERROR: '{key}' tidak boleh negatif!")
+            except Exception:
+                errors.append(f"CRITICAL ERROR: '{key}' harus berupa angka bulat!")
+
+    # Validate yellow forms exist (only y_sec/yellow_sec)
+    has_yellow = False
+    for k in ["y_sec", "yellow_sec"]:
+        if k in raw:
+            try:
+                v = int(raw[k])
+                if v < 0:
+                    errors.append(f"CRITICAL ERROR: '{k}' tidak boleh negatif!")
+                has_yellow = True
+                break
+            except Exception:
+                errors.append(f"CRITICAL ERROR: '{k}' harus berupa angka bulat!")
+                has_yellow = True
+                break
+    if not has_yellow:
+        errors.append("CRITICAL ERROR: Konfigurasi harus menyertakan durasi kuning (y_sec/yellow_sec)!")
+
+    # Derive r_sec from conflict_zone_meter and vehicle_speed_kmh (fault intolerant, no default)
+    try:
+        czm = raw.get("conflict_zone_meter")
+        vsm = raw.get("vehicle_speed_kmh")
+        if czm is None or vsm is None:
+            errors.append("CRITICAL ERROR: 'conflict_zone_meter' dan 'vehicle_speed_kmh' diperlukan untuk menghitung r_sec!")
+        else:
+            czm_i = int(czm)
+            vsm_i = int(vsm)
+            if czm_i < 0 or vsm_i <= 0:
+                errors.append("CRITICAL ERROR: 'conflict_zone_meter' tidak boleh negatif dan 'vehicle_speed_kmh' harus > 0!")
+            else:
+                r_sec_calc = math.ceil(czm_i / (vsm_i/3.6)) if vsm_i > 0 else 0
+                if r_sec_calc < 0:
+                    r_sec_calc = 0
+                # Store computed r_sec in raw for later use
+                raw["_r_sec_computed"] = r_sec_calc
+    except Exception as e:
+        errors.append(f"CRITICAL ERROR: Gagal menghitung r_sec dari conflict_zone_meter/vehicle_speed_kmh: {e}")
+
+    has_red = False
+    for k in ["r_sec", "red_sec"]:
+        if k in raw:
+            try:
+                v = int(raw[k])
+                if v < 0:
+                    errors.append(f"CRITICAL ERROR: '{k}' tidak boleh negatif!")
+                has_red = True
+                break
+            except Exception:
+                errors.append(f"CRITICAL ERROR: '{k}' harus berupa angka bulat!")
+                has_red = True
+                break
+    if not has_red and "_r_sec_computed" not in raw:
+        errors.append("CRITICAL ERROR: Konfigurasi harus menyertakan durasi merah (r_sec/red_sec) atau memungkinkan perhitungan dari conflict_zone_meter/vehicle_speed_kmh!")
+
+    # Validate serial_port
+    if "serial_port" in raw:
+        sp = raw["serial_port"]
+        if not isinstance(sp, str) or sp.strip() == "":
+            errors.append("CRITICAL ERROR: 'serial_port' harus berupa string tidak kosong!")
+
+    # Validate required numeric params
+    for key in ["saturation_headway_sec", "re_evaluate_interval_sec", "yolo_poll_interval_sec"]:
+        if key in raw:
+            try:
+                v = float(raw[key])
+                if v <= 0:
+                    errors.append(f"CRITICAL ERROR: '{key}' harus > 0!")
+            except Exception:
+                errors.append(f"CRITICAL ERROR: '{key}' harus berupa angka!")
+
+    lane_id_to_count, lanes_info = _parse_lanes(raw.get("lanes"), errors)
+
+    # Validate fallback sequence against conflict matrix if present
+    try:
+        cm = raw.get("conflict_matrix") or raw.get("conflicts")
+        fb = raw.get("fallback_sequence") or []
+        if isinstance(cm, (list, tuple)) and len(cm) == 8 and isinstance(fb, list):
+            for idx, phase in enumerate(fb):
+                try:
+                    if isinstance(phase, dict):
+                        active = phase.get("active_streams", phase.get("streams", []))
+                    elif isinstance(phase, (list, tuple)) and len(phase) >= 1:
+                        active = phase[0]
+                    else:
+                        continue
+                    if isinstance(active, (list, tuple, set)):
+                        act_list = list(active)
+                        for i in range(len(act_list)):
+                            for j in range(i+1, len(act_list)):
+                                s1 = int(act_list[i]); s2 = int(act_list[j])
+                                if 0 <= s1 < 8 and 0 <= s2 < 8:
+                                    if cm[s1][s2] == 1 or cm[s2][s1] == 1:
+                                        errors.append(f"CRITICAL ERROR: Fallback sequence phase {idx} has conflicting active streams {s1} and {s2}!")
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return errors, lane_id_to_count, lanes_info
+
+
+def _validate_lanes_vs_conflict_matrix(lanes_info, conflict_matrix, errors):
+    """Cross-check lanes array against conflict_matrix to catch deadlocks."""
+    if not lanes_info or not conflict_matrix:
+        return
+    try:
+        # Streams in the same lane group share a single physical lane - must not conflict
+        for entry in lanes_info:
+            stream_ids = entry.get("stream_ids", [])
+            if len(stream_ids) >= 2:
+                # These streams share a single physical lane - must not conflict
+                for i in range(len(stream_ids)):
+                    for j in range(i + 1, len(stream_ids)):
+                        s1 = stream_ids[i]
+                        s2 = stream_ids[j]
+                        if 0 <= s1 < 8 and 0 <= s2 < 8:
+                            if conflict_matrix[s1][s2] == 1 or conflict_matrix[s2][s1] == 1:
+                                errors.append(
+                                    f"CRITICAL ERROR: Deadlock - stream {s1} and {s2} share a single physical lane (N==1) but are marked as conflicting in conflict_matrix!")
+                                conflict_matrix[s1][s2] = 0
+                                conflict_matrix[s2][s1] = 0
+            pass
+    except Exception:
+        pass
 
 
 class ConfigManager:
@@ -178,7 +242,7 @@ class ConfigManager:
         self._valid = False
         self._errors = []
         self._lane_id_to_count = {}
-        self._enabled_phases = []
+        self._lanes_info = []
         self._last_mtime = None
 
         try:
@@ -194,13 +258,13 @@ class ConfigManager:
             self._errors = [f"CRITICAL ERROR: Gagal membaca konfigurasi: {e}"]
             return
 
-        errors, lane_id_to_count, phases = _validate_and_parse(raw)
+        errors, lane_id_to_count, lanes_info = _validate_and_parse(raw)
         self._errors = errors
         if errors:
             return
         self.config = raw
         self._lane_id_to_count = lane_id_to_count
-        self._enabled_phases = phases
+        self._lanes_info = lanes_info
         self._valid = True
 
     @property
@@ -224,15 +288,15 @@ class ConfigManager:
                     cfg["streams"] = streams
                 if conflict_matrix is not None:
                     cfg["conflict_matrix"] = conflict_matrix
-                for k in ["min_green", "inactive_queue_threshold", "starvation_tolerance",
+                for k in ["min_green", "max_extra_green", "inactive_queue_threshold", "starvation_tolerance",
                           "yellow_sec", "red_sec", "y_sec", "r_sec",
                           "fallback_sequence", "saturation_headway_sec", "re_evaluate_interval_sec"]:
                     if k in self.config:
                         cfg[k] = self.config[k]
-                # also map yellow_duration (s) to yellow_sec if missing
-                if "yellow_sec" not in cfg and "y_sec" not in cfg and "yellow_duration" in self.config:
+                # derive yellow_sec from y_sec if missing
+                if "yellow_sec" not in cfg and "y_sec" in self.config:
                     try:
-                        cfg["yellow_sec"] = int(self.config["yellow_duration"])
+                        cfg["yellow_sec"] = int(self.config["y_sec"])
                     except Exception:
                         pass
         except Exception:
@@ -257,7 +321,7 @@ class ConfigManager:
             self._errors = [f"CRITICAL ERROR: Gagal membaca konfigurasi: {e}"]
             return False
 
-        errors, lane_id_to_count, phases = _validate_and_parse(raw)
+        errors, lane_id_to_count, lanes_info = _validate_and_parse(raw)
         self._errors = errors
         if errors:
             self._valid = False
@@ -265,7 +329,7 @@ class ConfigManager:
 
         self.config = raw
         self._lane_id_to_count = lane_id_to_count
-        self._enabled_phases = phases
+        self._lanes_info = lanes_info
         self._valid = True
         return True
 
@@ -283,7 +347,7 @@ class ConfigManager:
         merged = dict(base)
         merged.update(new_data)
 
-        errors, lane_id_to_count, phases = _validate_and_parse(merged)
+        errors, lane_id_to_count, lanes_info = _validate_and_parse(merged)
         if errors:
             return False, errors
 
@@ -295,7 +359,7 @@ class ConfigManager:
 
         self.config = merged
         self._lane_id_to_count = lane_id_to_count
-        self._enabled_phases = phases
+        self._lanes_info = lanes_info
         self._valid = True
         self._errors = []
         try:
@@ -310,16 +374,17 @@ class ConfigManager:
             print("Status            : TIDAK VALID — sistem menunggu perbaikan")
             for err in self._errors:
                 print(f"  - {err}")
-        else:
-            print("Status            : valid")
-        print(f"Min Green         : {self.config.get('min_green')} detik")
-        print(f"Max Extra Green   : {self.config.get('max_extra_green')} detik")
-        print(f"Yellow Duration   : {self.config.get('yellow_duration')} detik")
-        print(f"Conflict Zone     : {self.config.get('conflict_zone_meter')} meter")
-        print(f"Vehicle Speed     : {self.config.get('vehicle_speed_ms')} m/s")
+            print("===============================\n")
+            return
+        print("Status            : valid")
+        print(f"Min Green         : {self.min_green} detik")
+        print(f"Max Extra Green   : {self.max_extra_green} detik")
+        print(f"Yellow Sec        : {self.yellow_sec} detik")
+        print(f"Red Sec           : {self.red_sec} detik")
+        print(f"Conflict Zone     : {self.conflict_zone_meter} meter")
+        print(f"Vehicle Speed     : {self.vehicle_speed_kmh} m/s")
         print(f"Lanes (ID->count) : {self.lanes}")
-        print(f"Fase Turunan      : {[s.name for s in self._enabled_phases]}")
-        print(f"Serial Port       : {self.config.get('serial_port')}")
+        print(f"Serial Port       : {self.serial_port}")
         print(f"Baud Rate         : {self.baud_rate}")
         print(f"YOLO Poll Interval: {self.yolo_poll_interval_sec} detik")
         print("===============================\n")
@@ -331,89 +396,77 @@ class ConfigManager:
     def max_extra_green(self) -> int: return self.config["max_extra_green"]
 
     @property
-    def yellow_duration(self) -> int: return self.config["yellow_duration"]
+    def conflict_zone_meter(self) -> int: return int(self.config["conflict_zone_meter"])
 
     @property
-    def conflict_zone_meter(self) -> int: return self.config["conflict_zone_meter"]
+    def vehicle_speed_kmh(self) -> int: return int(self.config["vehicle_speed_kmh"])
 
     @property
-    def vehicle_speed_ms(self) -> int: return self.config["vehicle_speed_ms"]
+    def lanes_info(self) -> list:
+        return list(self._lanes_info)
 
     @property
     def lanes(self) -> dict:
         return self._lane_id_to_count
 
-    @property
-    def enabled_phases(self) -> list:
-        return self._enabled_phases
-
-    @property
-    def inactive_queue_threshold(self) -> int:
-        try:
-            return int(self.config.get("inactive_queue_threshold", DEFAULT_INACTIVE_QUEUE_THRESHOLD))
-        except Exception:
-            return DEFAULT_INACTIVE_QUEUE_THRESHOLD
+    def validate_lanes_conflicts(self, conflict_matrix):
+        errors = []
+        _validate_lanes_vs_conflict_matrix(self._lanes_info, conflict_matrix, errors)
+        if errors:
+            for err in errors:
+                print(f"[CONFIG][WARN] {err}")
+        return len(errors) == 0
 
     @property
     def starvation_tolerance(self) -> int:
-        try:
-            return int(self.config.get("starvation_tolerance", DEFAULT_STARVATION_TOLERANCE))
-        except Exception:
-            return DEFAULT_STARVATION_TOLERANCE
+        return int(self.config["starvation_tolerance"])
 
     @property
     def yellow_sec(self) -> int:
-        try:
-            if "y_sec" in self.config:
-                return int(self.config["y_sec"])
-            if "yellow_sec" in self.config:
-                return int(self.config["yellow_sec"])
-            if "yellow_duration" in self.config:
-                return int(self.config["yellow_duration"])
-        except Exception:
-            pass
-        return DEFAULT_YELLOW_SEC
+        if "y_sec" in self.config:
+            return int(self.config["y_sec"])
+        if "yellow_sec" in self.config:
+            return int(self.config["yellow_sec"])
+        raise KeyError("yellow duration not found")
 
     @property
     def red_sec(self) -> int:
+        if "r_sec" in self.config:
+            return int(self.config["r_sec"])
+        if "red_sec" in self.config:
+            return int(self.config["red_sec"])
+        # Try computed
+        if "_r_sec_computed" in self.config:
+            return int(self.config["_r_sec_computed"])
+        # Compute on-the-fly if possible
         try:
-            if "r_sec" in self.config:
-                return int(self.config["r_sec"])
-            if "red_sec" in self.config:
-                return int(self.config["red_sec"])
+            czm = int(self.config["conflict_zone_meter"])
+            vsm = int(self.config["vehicle_speed_kmh"])
+            if vsm <= 0:
+                raise KeyError("vehicle_speed_kmh must be > 0")
+            r_sec_calc = math.ceil(czm / (vsm/3.6))
+            return int(r_sec_calc)
         except Exception:
-            pass
-        return DEFAULT_RED_SEC
+            raise KeyError("red duration not found")
 
     @property
     def saturation_headway_sec(self) -> float:
-        try:
-            return float(self.config.get("saturation_headway_sec", DEFAULT_SATURATION_HEADWAY_SEC))
-        except Exception:
-            return DEFAULT_SATURATION_HEADWAY_SEC
+        return float(self.config["saturation_headway_sec"])
 
     @property
     def re_evaluate_interval_sec(self) -> float:
-        try:
-            return float(self.config.get("re_evaluate_interval_sec", DEFAULT_RE_EVALUATE_INTERVAL_SEC))
-        except Exception:
-            return DEFAULT_RE_EVALUATE_INTERVAL_SEC
+        return float(self.config["re_evaluate_interval_sec"])
 
     @property
-    def fallback_sequence(self) -> list:
-        try:
-            fs = self.config.get("fallback_sequence", DEFAULT_FALLBACK_SEQUENCE)
-            if isinstance(fs, list):
-                return fs
-            if isinstance(fs, str):
-                # try to parse as json string
-                try:
-                    import json as _json
-                    val = _json.loads(fs)
-                    if isinstance(val, list):
-                        return val
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return []
+    def serial_port(self) -> str:
+        return str(self.config["serial_port"])
+
+    @property
+    def baud_rate(self) -> int:
+        if "baud_rate" in self.config:
+            return int(self.config["baud_rate"])
+        return 115200
+
+    @property
+    def yolo_poll_interval_sec(self) -> float:
+        return float(self.config["yolo_poll_interval_sec"])

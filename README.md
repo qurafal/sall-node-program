@@ -92,11 +92,9 @@ Every 1 second:
 {
     "min_green": 10,
     "max_extra_green": 40,
-    "yellow_duration": 3,
     "y_sec": 3,
-    "r_sec": 2,
     "conflict_zone_meter": 150,
-    "vehicle_speed_ms": 10,
+    "vehicle_speed_kmh": 10,
     "saturation_headway_sec": 2.1,
     "re_evaluate_interval_sec": 10,
     "lanes": [
@@ -106,10 +104,10 @@ Every 1 second:
         [1, 7, 8]
     ],
     "streams": [
-        {"lane_count": 2, "queue": 0},
-        {"lane_count": 2, "queue": 0},
-        {"lane_count": 2, "queue": 0},
-        {"lane_count": 2, "queue": 0}
+        {"lane_count": 2},
+        {"lane_count": 2},
+        {"lane_count": 2},
+        {"lane_count": 2}
     ],
     "conflict_matrix": [
         [0,0,0,0,1,1,1,1],
@@ -133,7 +131,7 @@ Every 1 second:
 Key fields:
 - `streams` - Stream definitions from cloud config (renumbered to 0-7 by master)
 - `conflict_matrix` - 8x8 conflict matrix
-- `y_sec`/`r_sec` or `yellow_duration`/`red_sec` - Clearance times
+- `y_sec`/`r_sec` - Clearance times (r_sec derived from conflict_zone_meter/vehicle_speed_kmh)
 - `saturation_headway_sec` - Used for green time calculation
 - `re_evaluate_interval_sec` - Periodic re-evaluation interval
 - `fallback_sequence` - Dynamic fallback phases

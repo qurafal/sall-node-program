@@ -29,7 +29,19 @@ class MasterController:
         self.ambulance_detected = False
         # track active stream end times
         self.stream_expires = {}  # stream_id -> expires_at
-        self.re_evaluate_interval_sec = getattr(config_mgr, "re_evaluate_interval_sec", 10)
+        # look-ahead state
+        self.next_active_set = []
+        self.next_streams_info = {}
+        self._lookahead_computed = False
+        self._current_phase_active = []
+        try:
+            self.re_evaluate_interval_sec = float(config_mgr.re_evaluate_interval_sec)
+        except Exception:
+            self.re_evaluate_interval_sec = 10.0
+        try:
+            self.min_green = int(config_mgr.min_green)
+        except Exception:
+            self.min_green = 10
 
     @property
     def serial_connected(self):
@@ -148,72 +160,51 @@ class MasterController:
         except Exception:
             matrix = [[0] * 8 for _ in range(8)]
         self.conflict_matrix = matrix
+        try:
+            if hasattr(self.config, 'validate_lanes_conflicts'):
+                self.config.validate_lanes_conflicts(self.conflict_matrix)
+        except Exception:
+            pass
 
         try:
-            self.min_green = cfg.get("min_green", getattr(self.config, "min_green", self.min_green))
+            self.min_green = int(cfg.get("min_green", self.config.min_green))
         except Exception:
-            pass
+            try:
+                self.min_green = int(self.config.min_green)
+            except Exception:
+                pass
         try:
-            self.re_evaluate_interval_sec = cfg.get("re_evaluate_interval_sec", getattr(self.config, "re_evaluate_interval_sec", self.re_evaluate_interval_sec))
+            self.re_evaluate_interval_sec = float(cfg.get("re_evaluate_interval_sec", self.config.re_evaluate_interval_sec))
         except Exception:
-            pass
+            try:
+                self.re_evaluate_interval_sec = float(self.config.re_evaluate_interval_sec)
+            except Exception:
+                pass
 
     # ---------- RE_EVALUATE ----------
     def priority_score(self, stream_id):
         if stream_id not in self.streams:
             return 0.0
         s = self.streams[stream_id]
-        queue = s.get("queue", 0)
         lane_count = max(1, s.get("lane_count", 1))
         max_wait = s.get("max_wait", 0)
-        return (queue / lane_count * 1.0) + (max_wait * 0.5)
+        return (max_wait * 0.5)
 
-    def re_evaluate(self):
-        # Get raw vehicle counts from yolo_worker per stream
-        raw_counts = {}
+    def _compute_lookahead(self):
         try:
-            if self.yolo_worker is not None:
-                raw_counts = self.yolo_worker.get_stream_counts() or {}
-        except Exception:
-            raw_counts = {}
-
-        # Calculate green times per stream (store in streams)
-        saturation_headway = getattr(self.config, "saturation_headway_sec", 2.1)
-        min_g = int(getattr(self.config, "min_green", self.min_green))
-        max_extra = int(getattr(self.config, "max_extra_green", 40))
-        for sid in list(self.streams.keys()):
-            try:
-                # get counts for stream sid (try S{sid} or just sid)
-                cnt = raw_counts.get(f"S{sid}") or raw_counts.get(sid) or {}
-                cars = int(cnt.get("car", cnt.get("mobil", 0)))
-                motos = int(cnt.get("motorcycle", cnt.get("motor", 0)))
-                trucks = int(cnt.get("truck", cnt.get("truk", 0)))
-                lane_count = max(1, self.streams[sid].get("lane_count", 1))
-                pcu = cars * 1.0 + motos * 0.3 + trucks * 2.5
-                if pcu <= 0:
-                    green_t = min_g
-                else:
-                    raw_gts = (pcu / lane_count) * saturation_headway
-                    green_t = int(max(min_g, min(min_g + max_extra, round(raw_gts))))
-                self.streams[sid]["green_time"] = green_t
-            except Exception:
-                self.streams[sid]["green_time"] = min_g
-
-        ranked = sorted(self.streams.keys(), key=self.priority_score, reverse=True)
-        active = []
-        for sid in ranked:
-            # check conflict with already active
-            incompatible = False
-            for a in active:
-                if self.conflict_matrix[sid][a] == 1 or self.conflict_matrix[a][sid] == 1:
-                    incompatible = True
-                    break
-            if incompatible:
-                continue
-            active.append(sid)
-        self.active_set = active
-        self._last_re_evaluate = time.time()
-        return active
+            # Save current active set context
+            current_active = list(self.active_set)
+            # Run re-evaluate to compute next
+            next_set = self.re_evaluate()
+            # Store
+            self.next_active_set = list(next_set)
+            self._lookahead_computed = True
+            self._current_phase_active = current_active
+            print(f"[MASTER][LOOKAHEAD] Computed next active set: {[f'S{s}' for s in self.next_active_set]}")
+        except Exception as e:
+            print(f"[MASTER][LOOKAHEAD][ERR] {e}")
+            self._lookahead_computed = False
+            self.next_active_set = []
 
     # ---------- Serial helpers ----------
     def _open_serial(self):
@@ -278,8 +269,8 @@ class MasterController:
                             time.sleep(RECONNECT_DELAY_SEC)
                             continue
                     # Build CMD_INIT payload
-                    y_sec = int(getattr(self.config, "yellow_sec", getattr(self.config, "yellow_duration", 3)))
-                    r_sec = int(getattr(self.config, "red_sec", 2))
+                    y_sec = int(self.config.yellow_sec)
+                    r_sec = int(self.config.red_sec)
                     # MATRIX 8 bytes
                     matrix_bytes = bytearray()
                     for i in range(8):
@@ -289,7 +280,6 @@ class MasterController:
                                 b |= (1 << j)
                         matrix_bytes.append(b)
                     payload = bytearray([y_sec & 0xFF, r_sec & 0xFF]) + bytes(matrix_bytes)
-                    # FB phases
                     fb = getattr(self.config, "fallback_sequence", [])
                     if isinstance(fb, list):
                         for phase in fb:
@@ -331,16 +321,22 @@ class MasterController:
                 elif self.state == MasterState.STREAM_TRANSITION:
                     # Send CMD_SET_STREAM sequentially with real-time delays
                     now = time.time()
+                    print(f"[MASTER][TRANSITION] Activating {len(self.active_set)} stream(s): {[f'S{s}' for s in self.active_set]}")
                     # Set all active streams to GREEN (target state) with delays? Plan says "master sends CMD_SET_STREAM sequentially with real-time delays"
                     # Target state encoding not fully specified, but use 0x01 for GREEN as example
                     for i, sid in enumerate(self.active_set):
                         try:
-                            green_t = self.streams.get(sid, {}).get("green_time", int(getattr(self.config, "min_green", 10)))
+                            try:
+                                green_t = self.streams.get(sid, {}).get("green_time", int(self.config.min_green))
+                            except Exception:
+                                green_t = self.streams.get(sid, {}).get("green_time", 10)
                             self.stream_expires[sid] = now + green_t
+                            s_info = self.streams.get(sid, {})
+                            print(f"[MASTER][TRANSITION]   -> S{sid} GREEN for {green_t}s (expires {self.stream_expires[sid]:.1f}, queue={s_info.get('queue',0)}, lc={s_info.get('lane_count',1)}, reason: highest priority non-conflicting)")
                             payload_st = bytes([sid & 0xFF, 0x01])  # assume 0x01 = GREEN
                             self._send(Command.CMD_SET_STREAM, payload_st)
                             if not self._wait_ack(Command.ACK_TRANSITION, timeout=2.0):
-                                pass
+                                print(f"[MASTER][TRANSITION]   ACK not received for S{sid}")
                             time.sleep(0.01)  # small real-time delay
                         except Exception as e:
                             print(f"[MASTER][ERR] stream transition {sid}: {e}")
@@ -357,17 +353,37 @@ class MasterController:
                             self._enter(MasterState.FAULT)
                             continue
                         self._last_heartbeat = now
+                    # Poll for ACK_CLEARED from ESP32 (green+yellow finished)
+                    try:
+                        frames = self.serial.read_frames() if self.serial is not None else []
+                    except Exception:
+                        frames = []
+                    for cmd, _ in frames:
+                        if cmd == Command.ACK_CLEARED:
+                            # Fire precomputed next phase immediately
+                            if self.next_active_set:
+                                self.active_set = list(self.next_active_set)
+                                self.next_active_set = []
+                                self._enter(MasterState.STREAM_TRANSITION)
+                            else:
+                                self._enter(MasterState.RE_EVALUATE)
+                            need_re_eval = False
+                            break
+                    if self.state != MasterState.ACTIVE_FLOW:
+                        continue
                     # Check expirations and gap-out
                     need_re_eval = False
                     if self.ambulance_detected:
                         # kill conflicting streams
                         self.ambulance_detected = False
+                        print("[MASTER][ACTIVE] Ambulance detected - triggering re-evaluation")
                         need_re_eval = True
                     else:
                         for sid in list(self.active_set):
                             expires = self.stream_expires.get(sid)
                             if expires is not None and now >= expires:
                                 try:
+                                    print(f"[MASTER][ACTIVE] S{sid} expired (now={now:.1f} >= expires={expires:.1f}) - setting RED, triggering re-evaluation")
                                     self._send(Command.CMD_SET_STREAM, bytes([sid & 0xFF, 0x00]))  # RED
                                     self._wait_ack(Command.ACK_TRANSITION, timeout=1.0)
                                 except Exception:
@@ -375,8 +391,14 @@ class MasterController:
                                 need_re_eval = True
                                 break
                             # gap-out: if past min_green and queue == 0
-                            if expires is not None and now > (expires - self.streams.get(sid, {}).get("green_time", 10) + int(getattr(self.config, "min_green", 10))) and self.streams.get(sid, {}).get("queue", 0) == 0:
+                            green_t = self.streams.get(sid, {}).get("green_time", 10)
+                            try:
+                                min_g = int(self.config.min_green)
+                            except Exception:
+                                min_g = 10
+                            if expires is not None and now > (expires - green_t + min_g) :
                                 try:
+                                    print(f"[MASTER][ACTIVE] S{sid} gap-out: past min_green ({min_g}s) with queue=0 - setting RED, triggering re-evaluation")
                                     self._send(Command.CMD_SET_STREAM, bytes([sid & 0xFF, 0x00]))
                                     self._wait_ack(Command.ACK_TRANSITION, timeout=1.0)
                                 except Exception:
@@ -385,11 +407,12 @@ class MasterController:
                                 break
                     # Periodic check
                     if not need_re_eval and now - self._last_re_evaluate > self.re_evaluate_interval_sec:
+                        print(f"[MASTER][ACTIVE] Periodic re-evaluation (>{self.re_evaluate_interval_sec}s elapsed)")
                         need_re_eval = True
                     if need_re_eval:
                         self._enter(MasterState.RE_EVALUATE)
                         continue
-                    time.sleep(POLL_INTERVAL_SEC)
+
                 elif self.state == MasterState.FAULT:
                     try:
                         self._send(Command.CMD_RESYNC)
@@ -406,7 +429,6 @@ class MasterController:
             except Exception as e:
                 print(f"[MASTER][ERROR] {e}")
                 self._enter(MasterState.FAULT)
-            time.sleep(0)
 
     def shutdown(self):
         self.stop()

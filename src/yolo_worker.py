@@ -3,7 +3,6 @@ import threading
 import time
 
 from config import ConfigManager
-from protocol import LANE_DIRECTIONS
 
 
 prepared_cycle_payload = bytearray()
@@ -42,55 +41,31 @@ class YoLoWorker:
             return
         data = self.get_stream_counts()
         with payload_lock:
-            prepared_cycle_payload[:] = b"YOLO:"  # marker for new format if needed
-        # Store in a way accessible; for now attach to instance pattern via module? 
-        # But master needs to call get_stream_counts() directly
+            prepared_cycle_payload[:] = b"YOLO:"
         self._last_stream_counts = data
 
     def get_stream_counts(self) -> dict:
-        """Return per-stream raw counts. Master maps lanes->streams using config/cloud.
-        Format: {"S0": {"car": 5, "motorcycle": 12, "truck": 1}} or just per-stream by key.
-        """
         stream_counts = {}
-        # Use local config.lanes as per plan decision 9/23? Plan says "keeps using local `config.lanes`; master maps lanes→streams"
-        lanes = getattr(self.config, "lanes", {}) or {}
-        # Build dummy data per direction/lane group
-        # Assign to streams in order of lanes entries
-        stream_idx = 0
-        # Iterate over lanes in order they appear conceptually
-        try:
-            # lanes is dict lane_id->count; map by direction groups similar to before
-            direction_to_vehicles = {}
-            for lane_id, count in lanes.items():
-                direction = LANE_DIRECTIONS.get(lane_id)
-                if direction not in direction_to_vehicles:
-                    if random.random() > 0.8:
-                        direction_to_vehicles[direction] = {"car": 0, "motorcycle": 0, "truck": 0}
-                    else:
-                        direction_to_vehicles[direction] = {
-                            "car": random.randint(0, 15),
-                            "motorcycle": random.randint(0, 30),
-                            "truck": random.randint(0, 3)
-                        }
-            # Map directions to streams - simple assignment
-            # Get unique directions in order
-            seen_dirs = []
-            for lane_id in lanes.keys():
-                d = LANE_DIRECTIONS.get(lane_id)
-                if d and d not in seen_dirs:
-                    seen_dirs.append(d)
-            for i, d in enumerate(seen_dirs):
-                v = direction_to_vehicles.get(d, {"car": 0, "motorcycle": 0, "truck": 0})
-                stream_counts[f"S{i}"] = {
-                    "car": v.get("car", 0),
-                    "motorcycle": v.get("motorcycle", 0),
-                    "truck": v.get("truck", 0),
+        lanes_info = getattr(self.config, "lanes_info", []) if hasattr(self.config, "lanes_info") else []
+        seen = []
+        if lanes_info:
+            for entry in lanes_info:
+                for sid in entry.get("stream_ids", []):
+                    if sid not in seen:
+                        seen.append(sid)
+        if not seen:
+            lanes = getattr(self.config, "lanes", {}) or {}
+            seen = list(lanes.keys()) if isinstance(lanes, dict) else []
+        for sid in seen:
+            if random.random() > 0.8:
+                stream_counts[f"S{sid}"] = {"car": 0, "motorcycle": 0, "truck": 0}
+            else:
+                stream_counts[f"S{sid}"] = {
+                    "car": random.randint(0, 15),
+                    "motorcycle": random.randint(0, 30),
+                    "truck": random.randint(0, 3),
                 }
-                stream_idx += 1
-        except Exception:
-            pass
         return stream_counts
 
     def get_dummy_vehicles(self) -> dict:
-        # Kept for compatibility
         return self.get_stream_counts()

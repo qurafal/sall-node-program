@@ -1,39 +1,149 @@
 {
     "min_green": 10,
     "max_extra_green": 40,
-    "yellow_duration": 3,
     "y_sec": 3,
-    "r_sec": 2,
     "conflict_zone_meter": 150,
-    "vehicle_speed_ms": 10,
+    "vehicle_speed_kmh": 36,
     "saturation_headway_sec": 2.1,
     "re_evaluate_interval_sec": 10,
     "lanes": [
-        [1, 1, 2],
-        [2, 3, 4],
-        [1, 5, 6],
-        [1, 7, 8]
+        [
+            0,
+            1
+        ],
+        [
+            2,
+            3
+        ],
+        [
+            4,
+            5
+        ],
+        [
+            6,
+            7
+        ]
     ],
     "streams": [
-        {"lane_count": 2, "queue": 0},
-        {"lane_count": 2, "queue": 0},
-        {"lane_count": 2, "queue": 0},
-        {"lane_count": 2, "queue": 0}
+        {
+            "lane_count": 2
+        },
+        {
+            "lane_count": 2
+        },
+        {
+            "lane_count": 2
+        },
+        {
+            "lane_count": 2
+        },
+        {
+            "lane_count": 2
+        },
+        {
+            "lane_count": 2
+        },
+        {
+            "lane_count": 2
+        },
+        {
+            "lane_count": 2
+        }
     ],
     "conflict_matrix": [
-        [0, 0, 0, 0, 1, 1, 1, 1],
-        [0, 0, 0, 0, 1, 1, 1, 1],
-        [0, 0, 0, 0, 1, 1, 1, 1],
-        [0, 0, 0, 0, 1, 1, 1, 1],
-        [1, 1, 1, 1, 0, 0, 0, 0],
-        [1, 1, 1, 1, 0, 0, 0, 0],
-        [1, 1, 1, 1, 0, 0, 0, 0],
-        [1, 1, 1, 1, 0, 0, 0, 0]
+        [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ],
+        [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ],
+        [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ],
+        [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ],
+        [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ],
+        [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ],
+        [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ],
+        [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ]
     ],
     "fallback_sequence": [
-        {"active_streams": [0, 1, 2, 3], "duration_s": 30}
+        {
+            "active_streams": [
+                0,
+                1,
+                2,
+                3
+            ],
+            "duration_s": 30
+        }
     ],
-    "serial_port": "/dev/ttyUSB0",
+    "serial_port": "COM8",
     "baud_rate": 115200,
     "yolo_poll_interval_sec": 2
 }
