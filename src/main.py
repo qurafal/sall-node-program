@@ -1,6 +1,7 @@
 import time
 from config import ConfigManager
 from master_controller import MasterController
+from yolo_worker import YoLoWorker
 
 
 def main():
@@ -17,12 +18,16 @@ def main():
 
     config_mgr.print_all_config()
 
-    controller = MasterController(config_mgr)
+    yolo = YoLoWorker(config_mgr)
+    yolo.start()
+
+    controller = MasterController(config_mgr, yolo_worker=yolo)
     try:
         controller.run()
     except KeyboardInterrupt:
         print("\n[SHUTDOWN] Sistem dihentikan oleh pengguna.")
     finally:
+        yolo.stop()
         controller.shutdown()
 
 if __name__ == "__main__":

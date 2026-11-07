@@ -1,5 +1,6 @@
 import threading
 import time
+from enum import Enum
 
 import serial
 
@@ -8,6 +9,14 @@ from protocol import Command, MasterState, HEADER_BYTES
 
 POLL_INTERVAL_SEC = 0.02
 RECONNECT_DELAY_SEC = 2.0
+
+
+class AckStatus(Enum):
+    MATCHED = "matched"
+    REJECTED = "rejected"
+    TIMEOUT = "timeout"
+    NO_SERIAL = "no_serial"
+    ERROR = "error"
 
 
 class MasterController:
@@ -187,8 +196,69 @@ class MasterController:
             return 0.0
         s = self.streams[stream_id]
         lane_count = max(1, s.get("lane_count", 1))
+        queue = s.get("queue", 0)
         max_wait = s.get("max_wait", 0)
-        return (max_wait * 0.5)
+        return (queue / lane_count * 1.0) + (max_wait * 0.5)
+
+    def re_evaluate(self):
+        """Pick the highest-priority non-conflicting streams to activate next.
+
+        Reads vehicle counts from yolo_worker (if wired), computes PCU per
+        stream, sets queue + green_time, then greedily selects a non-conflicting
+        active set. Returns the chosen active stream id list.
+        """
+        # --- Fetch vehicle counts from YOLO worker ---
+        stream_counts = {}
+        if self.yolo_worker is not None:
+            try:
+                stream_counts = self.yolo_worker.get_stream_counts()
+            except Exception:
+                stream_counts = {}
+
+        # --- Compute PCU, queue, green_time per stream ---
+        min_g = self.min_green
+        try:
+            max_extra = int(getattr(self.config, "max_extra_green", 40))
+        except Exception:
+            max_extra = 40
+        try:
+            headway = float(getattr(self.config, "saturation_headway_sec", 2.1))
+        except Exception:
+            headway = 2.1
+
+        for sid in self.streams:
+            s = self.streams[sid]
+            counts = stream_counts.get(f"S{sid}", {"car": 0, "motorcycle": 0, "truck": 0})
+            pcu = (counts.get("car", 0) * 1.0
+                   + counts.get("motorcycle", 0) * 0.3
+                   + counts.get("truck", 0) * 2.5)
+            lane_count = max(1, s.get("lane_count", 1))
+            s["queue"] = pcu
+            green_t = (pcu / lane_count) * headway
+            s["green_time"] = max(min_g, min(min_g + max_extra, green_t))
+
+        # --- Greedy select non-conflicting active set by priority ---
+        stream_ids = sorted(self.streams.keys(), key=lambda s: self.priority_score(s), reverse=True)
+        active = []
+        for sid in stream_ids:
+            conflict = False
+            for sel in active:
+                if 0 <= sid < 8 and 0 <= sel < 8:
+                    if self.conflict_matrix[sid][sel] == 1 or self.conflict_matrix[sel][sid] == 1:
+                        conflict = True
+                        break
+            if not conflict:
+                active.append(sid)
+        self.active_set = active
+        if active:
+            main_sid = active[0]
+            main_gt = self.streams.get(main_sid, {}).get("green_time")
+            if main_gt is not None:
+                for sid in active:
+                    if sid in self.streams:
+                        self.streams[sid]["green_time"] = main_gt
+        print(f"[MASTER][RE_EVALUATE] Active set: {[f'S{s}' for s in active]}" + (f" (shared green_time={main_gt}s)" if active and main_gt is not None else ""))
+        return active
 
     def _compute_lookahead(self):
         try:
@@ -235,20 +305,20 @@ class MasterController:
         deadline = None if timeout is None else time.time() + timeout
         while self._running:
             if self.serial is None:
-                return False
+                return AckStatus.NO_SERIAL
             try:
                 frames = self.serial.read_frames()
             except Exception:
-                return False
+                return AckStatus.ERROR
             for cmd, _ in frames:
                 if cmd == ack_cmd:
-                    return True
+                    return AckStatus.MATCHED
                 if cmd == Command.ACK_REJECTED:
-                    return False
+                    return AckStatus.REJECTED
             if deadline is not None and time.time() > deadline:
-                return False
+                return AckStatus.TIMEOUT
             time.sleep(POLL_INTERVAL_SEC)
-        return False
+        return AckStatus.TIMEOUT
 
     # ---------- State transitions ----------
     def _enter(self, state):
@@ -311,9 +381,26 @@ class MasterController:
                         print(f"[MASTER][ERR] send init: {e}")
                         self._enter(MasterState.FAULT)
                         continue
-                    if self._wait_ack(Command.ACK_INIT_OK, timeout=5.0):
+                    status = self._wait_ack(Command.ACK_INIT_OK, timeout=5.0)
+                    if status == AckStatus.MATCHED:
                         self._enter(MasterState.RE_EVALUATE)
+                    elif status in (AckStatus.TIMEOUT, AckStatus.NO_SERIAL, AckStatus.ERROR):
+                        # bounded single retry on transient causes
+                        print(f"[MASTER][INIT] ACK_INIT_OK {status.value}; retrying once")
+                        try:
+                            self._send(Command.CMD_INIT, bytes(payload))
+                        except Exception as e:
+                            print(f"[MASTER][ERR] send init retry: {e}")
+                            self._enter(MasterState.FAULT)
+                            continue
+                        status2 = self._wait_ack(Command.ACK_INIT_OK, timeout=5.0)
+                        if status2 == AckStatus.MATCHED:
+                            self._enter(MasterState.RE_EVALUATE)
+                        else:
+                            print(f"[MASTER][INIT] ACK_INIT_OK failed after retry: {status2.value}")
+                            self._enter(MasterState.FAULT)
                     else:
+                        print(f"[MASTER][INIT] ACK_INIT_OK {status.value}")
                         self._enter(MasterState.FAULT)
                 elif self.state == MasterState.RE_EVALUATE:
                     self.re_evaluate()
@@ -326,22 +413,34 @@ class MasterController:
                     # Target state encoding not fully specified, but use 0x01 for GREEN as example
                     for i, sid in enumerate(self.active_set):
                         try:
+                            green_t = self.streams.get(sid, {}).get("green_time", 10)
                             try:
                                 green_t = self.streams.get(sid, {}).get("green_time", int(self.config.min_green))
                             except Exception:
                                 green_t = self.streams.get(sid, {}).get("green_time", 10)
-                            self.stream_expires[sid] = now + green_t
                             s_info = self.streams.get(sid, {})
-                            print(f"[MASTER][TRANSITION]   -> S{sid} GREEN for {green_t}s (expires {self.stream_expires[sid]:.1f}, queue={s_info.get('queue',0)}, lc={s_info.get('lane_count',1)}, reason: highest priority non-conflicting)")
+                            print(f"[MASTER][TRANSITION]   -> S{sid} GREEN for {green_t}s (expires pending, queue={s_info.get('queue',0)}, lc={s_info.get('lane_count',1)}, reason: highest priority non-conflicting)")
                             payload_st = bytes([sid & 0xFF, 0x01])  # assume 0x01 = GREEN
                             self._send(Command.CMD_SET_STREAM, payload_st)
-                            if not self._wait_ack(Command.ACK_TRANSITION, timeout=2.0):
-                                print(f"[MASTER][TRANSITION]   ACK not received for S{sid}")
+                            status = self._wait_ack(Command.ACK_TRANSITION, timeout=2.0)
+                            if status == AckStatus.MATCHED:
+                                self.stream_expires[sid] = now + green_t
+                            elif status == AckStatus.REJECTED:
+                                print(f"[MASTER][TRANSITION] ACK_REJECTED for S{sid} (target GREEN)")
+                                if sid in self.active_set:
+                                    self.active_set = [x for x in self.active_set if x != sid]
+                                self.stream_expires.pop(sid, None)
+                            else:
+                                print(f"[MASTER][TRANSITION] ACK {status.value} for S{sid} (target GREEN)")
+                                if sid in self.active_set:
+                                    self.active_set = [x for x in self.active_set if x != sid]
+                                self.stream_expires.pop(sid, None)
                             time.sleep(0.01)  # small real-time delay
                         except Exception as e:
                             print(f"[MASTER][ERR] stream transition {sid}: {e}")
                     self._enter(MasterState.ACTIVE_FLOW)
                     self._last_heartbeat = time.time()
+                    self._last_re_evaluate = time.time()
                     self._state_entered_at = time.time()
                 elif self.state == MasterState.ACTIVE_FLOW:
                     now = time.time()
@@ -385,22 +484,27 @@ class MasterController:
                                 try:
                                     print(f"[MASTER][ACTIVE] S{sid} expired (now={now:.1f} >= expires={expires:.1f}) - setting RED, triggering re-evaluation")
                                     self._send(Command.CMD_SET_STREAM, bytes([sid & 0xFF, 0x00]))  # RED
-                                    self._wait_ack(Command.ACK_TRANSITION, timeout=1.0)
+                                    st = self._wait_ack(Command.ACK_TRANSITION, timeout=1.0)
+                                    if st != AckStatus.MATCHED:
+                                        print(f"[MASTER][ACTIVE] RED ACK {st.value} for S{sid}")
                                 except Exception:
                                     pass
                                 need_re_eval = True
                                 break
                             # gap-out: if past min_green and queue == 0
                             green_t = self.streams.get(sid, {}).get("green_time", 10)
+                            s_info = self.streams.get(sid, {})
                             try:
                                 min_g = int(self.config.min_green)
                             except Exception:
                                 min_g = 10
-                            if expires is not None and now > (expires - green_t + min_g) :
+                            if expires is not None and now > (expires - green_t + min_g) and s_info.get("queue", 0) == 0:
                                 try:
                                     print(f"[MASTER][ACTIVE] S{sid} gap-out: past min_green ({min_g}s) with queue=0 - setting RED, triggering re-evaluation")
                                     self._send(Command.CMD_SET_STREAM, bytes([sid & 0xFF, 0x00]))
-                                    self._wait_ack(Command.ACK_TRANSITION, timeout=1.0)
+                                    st = self._wait_ack(Command.ACK_TRANSITION, timeout=1.0)
+                                    if st != AckStatus.MATCHED:
+                                        print(f"[MASTER][ACTIVE] RED ACK {st.value} for S{sid}")
                                 except Exception:
                                     pass
                                 need_re_eval = True
