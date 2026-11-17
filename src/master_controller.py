@@ -35,7 +35,11 @@ class MasterController:
         self._state_entered_at = time.time()
         self._last_heartbeat = 0.0
         self._last_re_evaluate = 0.0
+        self._last_min_green_warn = 0.0
         self.ambulance_detected = False
+        # stream yang benar-benar sedang GREEN di sisi slave (authority untuk
+        # menentukan perlu-tidaknya RED/GREEN ulang saat transisi)
+        self.green_streams = set()
         # track active stream end times
         self.stream_expires = {}  # stream_id -> expires_at
         # look-ahead state
@@ -43,6 +47,8 @@ class MasterController:
         self.next_streams_info = {}
         self._lookahead_computed = False
         self._current_phase_active = []
+        # active set sebelum re_evaluate() menimpanya (untuk fase RED)
+        self._prev_active_before_transition = []
         try:
             self.re_evaluate_interval_sec = float(config_mgr.re_evaluate_interval_sec)
         except Exception:
@@ -296,14 +302,80 @@ class MasterController:
                 pass
         self.serial = None
 
-    def _send(self, cmd, payload=b""):
+    def _send(self, cmd, payload=b"", clear_rx=True):
         if self.serial is None:
             raise RuntimeError("serial not connected")
+        # Buang ACK/byte basi tepat sebelum command baru dikirim supaya
+        # _wait_ack() tidak pernah "menemukan" ACK dari siklus sebelumnya.
+        # Heartbeat tidak membersihkan RX (bisa memotong frame ACK yang sedang
+        # masuk sebagian).
+        if clear_rx:
+            clear = getattr(self.serial, "clear_rx_buffer", None)
+            if callable(clear):
+                clear()
         self.serial.send_frame(cmd, payload)
+
+    def _reset_phase_state(self):
+        """Lupakan state green setelah slave (re)inisialisasi via CMD_INIT."""
+        self.green_streams.clear()
+        self.stream_expires.clear()
+        self.active_set = []
+        self._prev_active_before_transition = []
+
+    def _min_green_elapsed(self) -> bool:
+        """True bila semua stream aktif sudah melewati min_green.
+
+        Stream tanpa entri stream_expires dianggap sudah lewat (tidak memblokir).
+        """
+        try:
+            min_g = int(self.config.min_green)
+        except Exception:
+            min_g = 10
+        now = time.time()
+        for sid in self.active_set:
+            expires = self.stream_expires.get(sid)
+            if expires is None:
+                continue
+            green_t = self.streams.get(sid, {}).get("green_time", min_g)
+            if now < (expires - green_t) + min_g:
+                return False
+        return True
 
     def _wait_ack(self, ack_cmd, timeout=None):
         deadline = None if timeout is None else time.time() + timeout
         while self._running:
+            if self.serial is None:
+                return AckStatus.NO_SERIAL
+            try:
+                frames = self.serial.read_frames()
+            except Exception:
+                return AckStatus.ERROR
+            for cmd, _ in frames:
+                if cmd == ack_cmd:
+                    return AckStatus.MATCHED
+                if cmd == Command.ACK_REJECTED:
+                    return AckStatus.REJECTED
+            if deadline is not None and time.time() > deadline:
+                return AckStatus.TIMEOUT
+            time.sleep(POLL_INTERVAL_SEC)
+        return AckStatus.TIMEOUT
+
+    def _wait_ack_keepalive(self, ack_cmd, timeout=None, hb_interval=1.0):
+        """_wait_ack + heartbeat keep-alive selama menunggu ACK.
+
+        Dipakai di STREAM_TRANSITION: satu ACK_TRANSITION yang lambat/timeout
+        (2s) per stream bisa menumpuk jadi >5s tanpa heartbeat dan memicu
+        watchdog ESP32. Dengan ini gap heartbeat tetap <= ~hb_interval.
+        """
+        deadline = None if timeout is None else time.time() + timeout
+        while self._running:
+            now = time.time()
+            if now - self._last_heartbeat >= hb_interval:
+                try:
+                    self._send(Command.CMD_HEARTBEAT, clear_rx=False)
+                except Exception:
+                    return AckStatus.ERROR
+                self._last_heartbeat = now
             if self.serial is None:
                 return AckStatus.NO_SERIAL
             try:
@@ -350,31 +422,44 @@ class MasterController:
                                 b |= (1 << j)
                         matrix_bytes.append(b)
                     payload = bytearray([y_sec & 0xFF, r_sec & 0xFF]) + bytes(matrix_bytes)
+                    # Fase fallback: pasangan [MASK, DURATION_S] (mask 0..255, dur 0..255)
                     fb = getattr(self.config, "fallback_sequence", [])
                     if isinstance(fb, list):
                         for phase in fb:
                             try:
                                 if isinstance(phase, dict):
-                                    active = phase.get("active_streams", phase.get("streams", []))
+                                    if "mask" in phase:
+                                        mask = int(phase["mask"])
+                                    else:
+                                        active = phase.get("active_streams", phase.get("streams", []))
+                                        mask = 0
+                                        if isinstance(active, (list, tuple, set)):
+                                            for sid in active:
+                                                s = int(sid)
+                                                if 0 <= s < 8:
+                                                    mask |= (1 << s)
                                     dur = int(phase.get("duration_s", phase.get("duration", 0)))
                                 elif isinstance(phase, (list, tuple)) and len(phase) >= 2:
-                                    active = phase[0]
+                                    first = phase[0]
+                                    if isinstance(first, bool):
+                                        mask = 0
+                                    elif isinstance(first, int):
+                                        mask = int(first)
+                                    else:
+                                        mask = 0
+                                        if isinstance(first, (list, tuple, set)):
+                                            for sid in first:
+                                                s = int(sid)
+                                                if 0 <= s < 8:
+                                                    mask |= (1 << s)
                                     dur = int(phase[1])
                                 else:
                                     continue
-                                mask = 0
-                                if isinstance(active, (list, tuple, set)):
-                                    for sid in active:
-                                        try:
-                                            s = int(sid)
-                                            if 0 <= s < 8:
-                                                mask |= (1 << s)
-                                        except Exception:
-                                            continue
-                                payload.append(mask & 0xFF)
-                                payload.append(dur & 0xFF)
+                                payload.append(max(0, min(255, mask)) & 0xFF)
+                                payload.append(max(0, min(255, dur)) & 0xFF)
                             except Exception:
                                 continue
+                    print(f"[MASTER][INIT] CMD_INIT payload={len(payload)} bytes (y={y_sec}, r={r_sec}, fallback_phases={len(fb) if isinstance(fb, list) else 0})")
                     try:
                         self._send(Command.CMD_INIT, bytes(payload))
                     except Exception as e:
@@ -383,6 +468,8 @@ class MasterController:
                         continue
                     status = self._wait_ack(Command.ACK_INIT_OK, timeout=5.0)
                     if status == AckStatus.MATCHED:
+                        # slave baru saja di-reset -> tidak ada stream yang GREEN
+                        self._reset_phase_state()
                         self._enter(MasterState.RE_EVALUATE)
                     elif status in (AckStatus.TIMEOUT, AckStatus.NO_SERIAL, AckStatus.ERROR):
                         # bounded single retry on transient causes
@@ -395,6 +482,7 @@ class MasterController:
                             continue
                         status2 = self._wait_ack(Command.ACK_INIT_OK, timeout=5.0)
                         if status2 == AckStatus.MATCHED:
+                            self._reset_phase_state()
                             self._enter(MasterState.RE_EVALUATE)
                         else:
                             print(f"[MASTER][INIT] ACK_INIT_OK failed after retry: {status2.value}")
@@ -403,51 +491,128 @@ class MasterController:
                         print(f"[MASTER][INIT] ACK_INIT_OK {status.value}")
                         self._enter(MasterState.FAULT)
                 elif self.state == MasterState.RE_EVALUATE:
+                    # Simpan active set SEBELUM re_evaluate() menimpanya, supaya
+                    # STREAM_TRANSITION tahu stream mana yang harus di-RED dulu.
+                    self._prev_active_before_transition = list(self.active_set)
                     self.re_evaluate()
                     self._enter(MasterState.STREAM_TRANSITION)
                 elif self.state == MasterState.STREAM_TRANSITION:
-                    # Send CMD_SET_STREAM sequentially with real-time delays
-                    now = time.time()
-                    print(f"[MASTER][TRANSITION] Activating {len(self.active_set)} stream(s): {[f'S{s}' for s in self.active_set]}")
-                    # Set all active streams to GREEN (target state) with delays? Plan says "master sends CMD_SET_STREAM sequentially with real-time delays"
-                    # Target state encoding not fully specified, but use 0x01 for GREEN as example
-                    for i, sid in enumerate(self.active_set):
-                        try:
-                            green_t = self.streams.get(sid, {}).get("green_time", 10)
+                    # Dua fase: (1) RED + clearance all-red untuk stream keluar,
+                    # (2) GREEN untuk stream masuk yang belum hijau.
+                    prev_active = set(self._prev_active_before_transition) | set(self.green_streams)
+                    new_set = list(self.active_set)
+                    try:
+                        y_sec = int(self.config.yellow_sec)
+                        r_sec = int(self.config.red_sec)
+                    except Exception as e:
+                        print(f"[MASTER][ERR] clearance config: {e}")
+                        self._enter(MasterState.FAULT)
+                        continue
+
+                    # ---- Fase 1: RED untuk stream yang keluar / berkonflik ----
+                    outgoing = set()
+                    for sid in prev_active:
+                        if sid not in new_set:
+                            outgoing.add(sid)
+                            continue
+                        for other in new_set:
+                            if other == sid:
+                                continue
+                            if 0 <= sid < 8 and 0 <= other < 8:
+                                if self.conflict_matrix[sid][other] or self.conflict_matrix[other][sid]:
+                                    outgoing.add(sid)
+                                    break
+
+                    if outgoing:
+                        print(f"[MASTER][TRANSITION] Fase 1/2 - RED untuk {[f'S{s}' for s in sorted(outgoing)]} "
+                              f"(clearance y+r={y_sec + r_sec}s)")
+                        for sid in sorted(outgoing):
                             try:
-                                green_t = self.streams.get(sid, {}).get("green_time", int(self.config.min_green))
-                            except Exception:
-                                green_t = self.streams.get(sid, {}).get("green_time", 10)
+                                self._send(Command.CMD_SET_STREAM, bytes([sid & 0xFF, 0x00]))  # RED
+                                st = self._wait_ack_keepalive(Command.ACK_TRANSITION, timeout=2.0)
+                                self.green_streams.discard(sid)
+                                self.stream_expires.pop(sid, None)
+                                if st == AckStatus.MATCHED:
+                                    print(f"[MASTER][TRANSITION]   S{sid} RED acknowledged")
+                                else:
+                                    print(f"[MASTER][TRANSITION]   S{sid} RED ACK {st.value}")
+                            except Exception as e:
+                                print(f"[MASTER][ERR] outgoing RED {sid}: {e}")
+                                self._enter(MasterState.FAULT)
+                                break
+                            time.sleep(0.01)
+                        if self.state != MasterState.STREAM_TRANSITION:
+                            continue
+
+                        # Tunggu clearance penuh slave (all-red) sambil heartbeat
+                        # dikirim tiap 1.0s agar watchdog 5s ESP32 tidak trip.
+                        clearance = y_sec + r_sec
+                        if clearance > 0:
+                            deadline = time.time() + clearance
+                            beats = 0
+                            while self._running:
+                                nowh = time.time()
+                                if nowh - self._last_heartbeat >= 1.0:
+                                    try:
+                                        self._send(Command.CMD_HEARTBEAT, clear_rx=False)
+                                    except Exception as e:
+                                        print(f"[MASTER][ERR] clearance heartbeat: {e}")
+                                        self._enter(MasterState.FAULT)
+                                        break
+                                    self._last_heartbeat = nowh
+                                    beats += 1
+                                rem = deadline - nowh
+                                if rem <= 0:
+                                    break
+                                time.sleep(min(0.05, rem))
+                            if self.state != MasterState.STREAM_TRANSITION:
+                                continue
+                            print(f"[MASTER][TRANSITION] Clearance {clearance}s selesai (heartbeat terkirim={beats})")
+
+                    # ---- Fase 2: GREEN untuk stream masuk yang belum hijau ----
+                    already_green = [s for s in new_set if s in self.green_streams]
+                    targets = [s for s in new_set if s not in self.green_streams]
+                    if already_green:
+                        print(f"[MASTER][TRANSITION] Sudah GREEN (skip): {[f'S{s}' for s in already_green]}")
+                    print(f"[MASTER][TRANSITION] Fase 2/2 - GREEN untuk {[f'S{s}' for s in targets]}")
+                    for sid in targets:
+                        try:
+                            green_t = self.streams.get(sid, {}).get("green_time")
+                            if green_t is None:
+                                green_t = self.min_green
                             s_info = self.streams.get(sid, {})
-                            print(f"[MASTER][TRANSITION]   -> S{sid} GREEN for {green_t}s (expires pending, queue={s_info.get('queue',0)}, lc={s_info.get('lane_count',1)}, reason: highest priority non-conflicting)")
-                            payload_st = bytes([sid & 0xFF, 0x01])  # assume 0x01 = GREEN
-                            self._send(Command.CMD_SET_STREAM, payload_st)
-                            status = self._wait_ack(Command.ACK_TRANSITION, timeout=2.0)
+                            print(f"[MASTER][TRANSITION]   -> S{sid} GREEN for {green_t}s "
+                                  f"(queue={s_info.get('queue', 0)}, lc={s_info.get('lane_count', 1)}, "
+                                  f"reason: highest priority non-conflicting)")
+                            self._send(Command.CMD_SET_STREAM, bytes([sid & 0xFF, 0x01]))  # GREEN
+                            status = self._wait_ack_keepalive(Command.ACK_TRANSITION, timeout=2.0)
                             if status == AckStatus.MATCHED:
-                                self.stream_expires[sid] = now + green_t
-                            elif status == AckStatus.REJECTED:
-                                print(f"[MASTER][TRANSITION] ACK_REJECTED for S{sid} (target GREEN)")
-                                if sid in self.active_set:
-                                    self.active_set = [x for x in self.active_set if x != sid]
-                                self.stream_expires.pop(sid, None)
+                                self.green_streams.add(sid)
+                                self.stream_expires[sid] = time.time() + green_t
                             else:
-                                print(f"[MASTER][TRANSITION] ACK {status.value} for S{sid} (target GREEN)")
-                                if sid in self.active_set:
-                                    self.active_set = [x for x in self.active_set if x != sid]
+                                if status == AckStatus.REJECTED:
+                                    print(f"[MASTER][TRANSITION] ACK_REJECTED for S{sid} (target GREEN)")
+                                else:
+                                    print(f"[MASTER][TRANSITION] ACK {status.value} for S{sid} (target GREEN)")
+                                self.green_streams.discard(sid)
                                 self.stream_expires.pop(sid, None)
-                            time.sleep(0.01)  # small real-time delay
                         except Exception as e:
                             print(f"[MASTER][ERR] stream transition {sid}: {e}")
+                        time.sleep(0.01)  # small real-time delay
+                    self.active_set = [s for s in new_set if s in self.green_streams]
+                    if not self.active_set:
+                        print("[MASTER][TRANSITION] Tidak ada stream yang berhasil di-GREEN-kan")
                     self._enter(MasterState.ACTIVE_FLOW)
                     self._last_heartbeat = time.time()
                     self._last_re_evaluate = time.time()
                     self._state_entered_at = time.time()
+                    self._prev_active_before_transition = []
                 elif self.state == MasterState.ACTIVE_FLOW:
                     now = time.time()
                     # Send heartbeat every 1 second
                     if now - self._last_heartbeat >= 1.0:
                         try:
-                            self._send(Command.CMD_HEARTBEAT)
+                            self._send(Command.CMD_HEARTBEAT, clear_rx=False)
                         except Exception:
                             self._enter(MasterState.FAULT)
                             continue
@@ -459,7 +624,11 @@ class MasterController:
                         frames = []
                     for cmd, _ in frames:
                         if cmd == Command.ACK_CLEARED:
-                            # Fire precomputed next phase immediately
+                            # Slave sudah menyelesaikan green+yellow -> tidak ada
+                            # stream yang masih GREEN, jadi tidak perlu RED/clearance.
+                            self.green_streams.clear()
+                            self.stream_expires.clear()
+                            self._prev_active_before_transition = []
                             if self.next_active_set:
                                 self.active_set = list(self.next_active_set)
                                 self.next_active_set = []
@@ -487,6 +656,8 @@ class MasterController:
                                     st = self._wait_ack(Command.ACK_TRANSITION, timeout=1.0)
                                     if st != AckStatus.MATCHED:
                                         print(f"[MASTER][ACTIVE] RED ACK {st.value} for S{sid}")
+                                    self.green_streams.discard(sid)
+                                    self.stream_expires.pop(sid, None)
                                 except Exception:
                                     pass
                                 need_re_eval = True
@@ -505,14 +676,23 @@ class MasterController:
                                     st = self._wait_ack(Command.ACK_TRANSITION, timeout=1.0)
                                     if st != AckStatus.MATCHED:
                                         print(f"[MASTER][ACTIVE] RED ACK {st.value} for S{sid}")
+                                    self.green_streams.discard(sid)
+                                    self.stream_expires.pop(sid, None)
                                 except Exception:
                                     pass
                                 need_re_eval = True
                                 break
-                    # Periodic check
+                    # Periodic check - jangan preempt sebelum min_green terpenuhi
+                    # (kecuali emergency preemption di atas).
                     if not need_re_eval and now - self._last_re_evaluate > self.re_evaluate_interval_sec:
-                        print(f"[MASTER][ACTIVE] Periodic re-evaluation (>{self.re_evaluate_interval_sec}s elapsed)")
-                        need_re_eval = True
+                        if self.active_set and not self._min_green_elapsed():
+                            if now - self._last_min_green_warn >= 2.0:
+                                print(f"[MASTER][ACTIVE] Menunda re-evaluation periodik: min_green belum terpenuhi "
+                                      f"(interval {self.re_evaluate_interval_sec}s sudah lewat)")
+                                self._last_min_green_warn = now
+                        else:
+                            print(f"[MASTER][ACTIVE] Periodic re-evaluation (>{self.re_evaluate_interval_sec}s elapsed)")
+                            need_re_eval = True
                     if need_re_eval:
                         self._enter(MasterState.RE_EVALUATE)
                         continue
@@ -523,7 +703,10 @@ class MasterController:
                     except Exception:
                         pass
                     time.sleep(RECONNECT_DELAY_SEC)
-                    self._enter(MasterState.RE_EVALUATE)
+                    # Selalu kembali ke handshake: jangan pernah menjalankan trafik
+                    # di atas slave yang belum terinisialisasi.
+                    print("[MASTER][FAULT] re-init slave via INIT_HARDWARE")
+                    self._enter(MasterState.INIT_HARDWARE)
                 elif self.state == MasterState.PREEMPTION:
                     time.sleep(POLL_INTERVAL_SEC)
             except serial.SerialException as e:

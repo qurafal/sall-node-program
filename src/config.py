@@ -14,6 +14,31 @@ REQUIRED_KEYS = [
 
 MAX_CYCLE_STEPS = 8
 
+# Nilai durasi dikirim 1 byte (0..255) ke slave. Simpan peringatan yang sudah
+# pernah dicetak supaya tidak spam log setiap kali properti diakses.
+_CLAMP_WARNED = set()
+
+
+def _clamp_u8(value, name: str) -> int:
+    """Klem durasi ke 0..255 agar tidak wrap via '& 0xFF' saat packing."""
+    try:
+        v = int(value)
+    except Exception:
+        return 0
+    if v < 0:
+        key = (name, v)
+        if key not in _CLAMP_WARNED:
+            _CLAMP_WARNED.add(key)
+            print(f"[CONFIG][WARN] {name}={v} di luar 0..255, diklem ke 0!")
+        return 0
+    if v > 255:
+        key = (name, v)
+        if key not in _CLAMP_WARNED:
+            _CLAMP_WARNED.add(key)
+            print(f"[CONFIG][WARN] {name}={v} di luar 0..255, diklem ke 255!")
+        return 255
+    return v
+
 # EFSM/cloud config defaults
 DEFAULT_INACTIVE_QUEUE_THRESHOLD = 5
 DEFAULT_STARVATION_TOLERANCE = 30
@@ -424,30 +449,80 @@ class ConfigManager:
     @property
     def yellow_sec(self) -> int:
         if "y_sec" in self.config:
-            return int(self.config["y_sec"])
-        if "yellow_sec" in self.config:
-            return int(self.config["yellow_sec"])
-        raise KeyError("yellow duration not found")
+            v = int(self.config["y_sec"])
+        elif "yellow_sec" in self.config:
+            v = int(self.config["yellow_sec"])
+        else:
+            raise KeyError("yellow duration not found")
+        return _clamp_u8(v, "yellow_sec")
 
     @property
     def red_sec(self) -> int:
         if "r_sec" in self.config:
-            return int(self.config["r_sec"])
-        if "red_sec" in self.config:
-            return int(self.config["red_sec"])
-        # Try computed
-        if "_r_sec_computed" in self.config:
-            return int(self.config["_r_sec_computed"])
-        # Compute on-the-fly if possible
-        try:
-            czm = int(self.config["conflict_zone_meter"])
-            vsm = int(self.config["vehicle_speed_kmh"])
-            if vsm <= 0:
-                raise KeyError("vehicle_speed_kmh must be > 0")
-            r_sec_calc = math.ceil(czm / (vsm/3.6))
-            return int(r_sec_calc)
-        except Exception:
-            raise KeyError("red duration not found")
+            v = int(self.config["r_sec"])
+        elif "red_sec" in self.config:
+            v = int(self.config["red_sec"])
+        elif "_r_sec_computed" in self.config:
+            v = int(self.config["_r_sec_computed"])
+        else:
+            # Compute on-the-fly if possible
+            try:
+                czm = int(self.config["conflict_zone_meter"])
+                vsm = int(self.config["vehicle_speed_kmh"])
+                if vsm <= 0:
+                    raise KeyError("vehicle_speed_kmh must be > 0")
+                v = int(math.ceil(czm / (vsm / 3.6)))
+            except Exception:
+                raise KeyError("red duration not found")
+        return _clamp_u8(v, "red_sec")
+
+    @property
+    def fallback_sequence(self) -> list:
+        """Fase fallback yang dinormalisasi: [{'mask': int, 'duration_s': int}, ...].
+
+        Menerima format {'active_streams': [...], 'duration_s': n} (config_example),
+        {'streams': [...], 'duration': n}, {'mask': 0x0F, 'duration_s': n},
+        maupun pasangan [mask, durasi] / [[stream...], durasi].
+        """
+        raw = self.config.get("fallback_sequence")
+        if not isinstance(raw, list):
+            return []
+
+        phases = []
+        for entry in raw:
+            mask = 0
+            dur = 0
+            try:
+                if isinstance(entry, dict):
+                    if "mask" in entry:
+                        mask = int(entry["mask"])
+                    else:
+                        active = entry.get("active_streams", entry.get("streams", []))
+                        if isinstance(active, (list, tuple, set)):
+                            for sid in active:
+                                s = int(sid)
+                                if 0 <= s < 8:
+                                    mask |= (1 << s)
+                    dur = int(entry.get("duration_s", entry.get("duration", 0)))
+                elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    first = entry[0]
+                    if isinstance(first, bool):
+                        mask = 0
+                    elif isinstance(first, int):
+                        mask = int(first)
+                    elif isinstance(first, (list, tuple, set)):
+                        for sid in first:
+                            s = int(sid)
+                            if 0 <= s < 8:
+                                mask |= (1 << s)
+                    dur = int(entry[1])
+            except Exception:
+                continue
+            phases.append({
+                "mask": mask & 0xFF,
+                "duration_s": max(0, min(255, dur)),
+            })
+        return phases
 
     @property
     def saturation_headway_sec(self) -> float:

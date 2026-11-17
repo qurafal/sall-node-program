@@ -1,0 +1,7 @@
+data/config.json
+.kilo/
+__pycache__/
+.vscode/
+
+data/config_example/
+ENVIRONMENT_ISSUES.txt

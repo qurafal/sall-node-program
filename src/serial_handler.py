@@ -1,8 +1,13 @@
 import threading
+import time
 
 import serial
 
 from protocol import HEADER_BYTES, build_frame, parse_stream
+
+# ESP32 reset (DTR/RTS) saat port dibuka -> beri waktu boot sebelum I/O pertama.
+OPEN_SETTLE_SEC = 2.0
+
 
 class SerialHandler:
     def __init__(self, config_mgr):
@@ -18,6 +23,28 @@ class SerialHandler:
             baudrate=self.config.baud_rate,
             timeout=0,
         )
+        # Membuka port men-toggle DTR/RTS -> ESP32 reboot. Tunggu boot selesai
+        # (jangan kirim CMD_INIT ke bootloader), lalu buang boot log & sisa byte.
+        time.sleep(OPEN_SETTLE_SEC)
+        try:
+            self.serial.reset_input_buffer()
+            self.serial.reset_output_buffer()
+        except Exception:
+            pass
+
+    def clear_rx_buffer(self):
+        """Buang byte serial yang belum terbaca + buffer frame internal.
+
+        Dipanggil tepat sebelum command baru dikirim supaya ACK basi
+        (mis. ACK_TRANSITION / ACK_REJECTED dari siklus sebelumnya) tidak
+        pernah dipenuhi oleh _wait_ack() untuk command berikutnya.
+        """
+        try:
+            if self.serial is not None and self.serial.is_open:
+                self.serial.read_all()
+        except Exception:
+            pass
+        self._buffer.clear()
 
     def is_open(self) -> bool:
         return self.serial is not None and self.serial.is_open
